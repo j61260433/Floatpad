@@ -691,3 +691,395 @@
 (define-read-only (get-current-emission-rate)
   (var-get base-emission-rate)
 )
+
+(define-constant ERR_INSURANCE_NOT_FOUND (err u116))
+(define-constant ERR_INSUFFICIENT_COVERAGE (err u117))
+(define-constant ERR_CLAIM_NOT_VALID (err u118))
+(define-constant ERR_PREMIUM_CALCULATION_FAILED (err u119))
+(define-constant ERR_INSURANCE_EXPIRED (err u120))
+(define-constant ERR_ALREADY_INSURED (err u121))
+(define-constant ERR_INSUFFICIENT_INSURANCE_FUNDS (err u122))
+(define-constant ERR_CLAIM_ALREADY_PROCESSED (err u123))
+
+(define-data-var total-insurance-pools uint u0)
+(define-data-var insurance-protocol-fee uint u500)
+(define-data-var base-premium-rate uint u200)
+(define-data-var claim-processing-delay uint u144)
+
+(define-map insurance-pools
+  { insurance-pool-id: uint }
+  {
+    pool-owner: principal,
+    coverage-type: (string-ascii 30),
+    total-coverage-capacity: uint,
+    available-coverage: uint,
+    premium-rate: uint,
+    min-coverage-amount: uint,
+    max-coverage-amount: uint,
+    pool-utilization: uint,
+    created-at: uint,
+    active-policies: uint
+  }
+)
+
+(define-map insurance-policies
+  { policy-id: uint }
+  {
+    insured-user: principal,
+    insurance-pool-id: uint,
+    coverage-amount: uint,
+    premium-paid: uint,
+    policy-start: uint,
+    policy-duration: uint,
+    insured-position-type: (string-ascii 20),
+    insured-pool-id: uint,
+    risk-score: uint,
+    policy-status: (string-ascii 10)
+  }
+)
+
+(define-map insurance-claims
+  { claim-id: uint }
+  {
+    policy-id: uint,
+    claimant: principal,
+    claim-amount: uint,
+    claim-type: (string-ascii 30),
+    claim-timestamp: uint,
+    evidence-hash: (buff 32),
+    claim-status: (string-ascii 15),
+    processed-at: uint,
+    payout-amount: uint
+  }
+)
+
+(define-map insurance-providers
+  { provider: principal, insurance-pool-id: uint }
+  {
+    provided-coverage: uint,
+    earned-premiums: uint,
+    coverage-share: uint,
+    last-premium-claim: uint,
+    provider-since: uint
+  }
+)
+
+(define-map risk-parameters
+  { risk-type: (string-ascii 20) }
+  {
+    base-multiplier: uint,
+    utilization-factor: uint,
+    volatility-adjustment: uint,
+    historical-loss-rate: uint
+  }
+)
+
+(define-data-var total-policies uint u0)
+(define-data-var total-claims uint u0)
+(define-data-var insurance-treasury uint u0)
+
+(define-public (create-insurance-pool (coverage-type (string-ascii 30)) (initial-coverage uint) (premium-rate uint) (min-coverage uint) (max-coverage uint))
+  (let
+    (
+      (insurance-pool-id (+ (var-get total-insurance-pools) u1))
+    )
+    (asserts! (> initial-coverage u0) ERR_INVALID_AMOUNT)
+    (asserts! (> premium-rate u0) ERR_INVALID_AMOUNT)
+    (asserts! (> max-coverage min-coverage) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? initial-coverage tx-sender (as-contract tx-sender)))
+    (map-set insurance-pools
+      { insurance-pool-id: insurance-pool-id }
+      {
+        pool-owner: tx-sender,
+        coverage-type: coverage-type,
+        total-coverage-capacity: initial-coverage,
+        available-coverage: initial-coverage,
+        premium-rate: premium-rate,
+        min-coverage-amount: min-coverage,
+        max-coverage-amount: max-coverage,
+        pool-utilization: u0,
+        created-at: stacks-block-height,
+        active-policies: u0
+      }
+    )
+    (map-set insurance-providers
+      { provider: tx-sender, insurance-pool-id: insurance-pool-id }
+      {
+        provided-coverage: initial-coverage,
+        earned-premiums: u0,
+        coverage-share: u10000,
+        last-premium-claim: stacks-block-height,
+        provider-since: stacks-block-height
+      }
+    )
+    (var-set total-insurance-pools insurance-pool-id)
+    (ok insurance-pool-id)
+  )
+)
+
+(define-public (provide-insurance-coverage (insurance-pool-id uint) (coverage-amount uint))
+  (let
+    (
+      (insurance-pool (unwrap! (map-get? insurance-pools { insurance-pool-id: insurance-pool-id }) ERR_INSURANCE_NOT_FOUND))
+      (existing-provider (default-to
+        { provided-coverage: u0, earned-premiums: u0, coverage-share: u0, last-premium-claim: u0, provider-since: u0 }
+        (map-get? insurance-providers { provider: tx-sender, insurance-pool-id: insurance-pool-id })
+      ))
+    )
+    (asserts! (> coverage-amount u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? coverage-amount tx-sender (as-contract tx-sender)))
+    (let
+      (
+        (new-total-capacity (+ (get total-coverage-capacity insurance-pool) coverage-amount))
+        (new-available-coverage (+ (get available-coverage insurance-pool) coverage-amount))
+        (new-provided-coverage (+ (get provided-coverage existing-provider) coverage-amount))
+        (new-coverage-share (/ (* new-provided-coverage u10000) new-total-capacity))
+      )
+      (map-set insurance-pools
+        { insurance-pool-id: insurance-pool-id }
+        (merge insurance-pool {
+          total-coverage-capacity: new-total-capacity,
+          available-coverage: new-available-coverage
+        })
+      )
+      (map-set insurance-providers
+        { provider: tx-sender, insurance-pool-id: insurance-pool-id }
+        (merge existing-provider {
+          provided-coverage: new-provided-coverage,
+          coverage-share: new-coverage-share,
+          provider-since: (if (is-eq (get provided-coverage existing-provider) u0) stacks-block-height (get provider-since existing-provider))
+        })
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (purchase-insurance-policy (insurance-pool-id uint) (coverage-amount uint) (duration-blocks uint) (insured-position-type (string-ascii 20)) (insured-pool-id uint))
+  (let
+    (
+      (insurance-pool (unwrap! (map-get? insurance-pools { insurance-pool-id: insurance-pool-id }) ERR_INSURANCE_NOT_FOUND))
+      (policy-id (+ (var-get total-policies) u1))
+      (risk-score (calculate-risk-score insured-position-type insured-pool-id coverage-amount))
+      (premium-amount (calculate-premium insurance-pool-id coverage-amount duration-blocks risk-score))
+    )
+    (asserts! (>= coverage-amount (get min-coverage-amount insurance-pool)) ERR_INVALID_AMOUNT)
+    (asserts! (<= coverage-amount (get max-coverage-amount insurance-pool)) ERR_INVALID_AMOUNT)
+    (asserts! (<= coverage-amount (get available-coverage insurance-pool)) ERR_INSUFFICIENT_COVERAGE)
+    (asserts! (> duration-blocks u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? premium-amount tx-sender (as-contract tx-sender)))
+    (map-set insurance-policies
+      { policy-id: policy-id }
+      {
+        insured-user: tx-sender,
+        insurance-pool-id: insurance-pool-id,
+        coverage-amount: coverage-amount,
+        premium-paid: premium-amount,
+        policy-start: stacks-block-height,
+        policy-duration: duration-blocks,
+        insured-position-type: insured-position-type,
+        insured-pool-id: insured-pool-id,
+        risk-score: risk-score,
+        policy-status: "active"
+      }
+    )
+    (map-set insurance-pools
+      { insurance-pool-id: insurance-pool-id }
+      (merge insurance-pool {
+        available-coverage: (- (get available-coverage insurance-pool) coverage-amount),
+        pool-utilization: (/ (* (- (get total-coverage-capacity insurance-pool) (- (get available-coverage insurance-pool) coverage-amount)) u10000) (get total-coverage-capacity insurance-pool)),
+        active-policies: (+ (get active-policies insurance-pool) u1)
+      })
+    )
+    (var-set total-policies policy-id)
+    (var-set insurance-treasury (+ (var-get insurance-treasury) (/ (* premium-amount (var-get insurance-protocol-fee)) u10000)))
+    (ok policy-id)
+  )
+)
+
+(define-public (file-insurance-claim (policy-id uint) (claim-amount uint) (claim-type (string-ascii 30)) (evidence-hash (buff 32)))
+  (let
+    (
+      (policy (unwrap! (map-get? insurance-policies { policy-id: policy-id }) ERR_INSURANCE_NOT_FOUND))
+      (claim-id (+ (var-get total-claims) u1))
+    )
+    (asserts! (is-eq (get insured-user policy) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get policy-status policy) "active") ERR_INSURANCE_EXPIRED)
+    (asserts! (<= (+ (get policy-start policy) (get policy-duration policy)) stacks-block-height) ERR_INSURANCE_EXPIRED)
+    (asserts! (<= claim-amount (get coverage-amount policy)) ERR_INVALID_AMOUNT)
+    (asserts! (> claim-amount u0) ERR_INVALID_AMOUNT)
+    (map-set insurance-claims
+      { claim-id: claim-id }
+      {
+        policy-id: policy-id,
+        claimant: tx-sender,
+        claim-amount: claim-amount,
+        claim-type: claim-type,
+        claim-timestamp: stacks-block-height,
+        evidence-hash: evidence-hash,
+        claim-status: "pending",
+        processed-at: u0,
+        payout-amount: u0
+      }
+    )
+    (var-set total-claims claim-id)
+    (ok claim-id)
+  )
+)
+
+(define-public (process-insurance-claim (claim-id uint) (approved bool))
+  (let
+    (
+      (claim (unwrap! (map-get? insurance-claims { claim-id: claim-id }) ERR_INSURANCE_NOT_FOUND))
+      (policy (unwrap! (map-get? insurance-policies { policy-id: (get policy-id claim) }) ERR_INSURANCE_NOT_FOUND))
+      (insurance-pool (unwrap! (map-get? insurance-pools { insurance-pool-id: (get insurance-pool-id policy) }) ERR_INSURANCE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get claim-status claim) "pending") ERR_CLAIM_ALREADY_PROCESSED)
+    (asserts! (>= stacks-block-height (+ (get claim-timestamp claim) (var-get claim-processing-delay))) ERR_INVALID_AMOUNT)
+    (let
+      (
+        (payout-amount (if approved (get claim-amount claim) u0))
+        (new-status (if approved "approved" "rejected"))
+      )
+      (map-set insurance-claims
+        { claim-id: claim-id }
+        (merge claim {
+          claim-status: new-status,
+          processed-at: stacks-block-height,
+          payout-amount: payout-amount
+        })
+      )
+      (if approved
+        (begin
+          (try! (as-contract (stx-transfer? payout-amount tx-sender (get claimant claim))))
+          (map-set insurance-pools
+            { insurance-pool-id: (get insurance-pool-id policy) }
+            (merge insurance-pool {
+              total-coverage-capacity: (- (get total-coverage-capacity insurance-pool) payout-amount),
+              active-policies: (- (get active-policies insurance-pool) u1)
+            })
+          )
+          (map-set insurance-policies
+            { policy-id: (get policy-id claim) }
+            (merge policy { policy-status: "claimed" })
+          )
+        )
+        (map-set insurance-policies
+          { policy-id: (get policy-id claim) }
+          (merge policy { policy-status: "expired" })
+        )
+      )
+      (ok approved)
+    )
+  )
+)
+
+(define-public (claim-provider-premiums (insurance-pool-id uint))
+  (let
+    (
+      (provider-info (unwrap! (map-get? insurance-providers { provider: tx-sender, insurance-pool-id: insurance-pool-id }) ERR_INSURANCE_NOT_FOUND))
+      (insurance-pool (unwrap! (map-get? insurance-pools { insurance-pool-id: insurance-pool-id }) ERR_INSURANCE_NOT_FOUND))
+      (blocks-since-last-claim (- stacks-block-height (get last-premium-claim provider-info)))
+      (total-premiums-earned (calculate-provider-premiums insurance-pool-id tx-sender blocks-since-last-claim))
+    )
+    (asserts! (> total-premiums-earned u0) ERR_INSUFFICIENT_REWARDS)
+    (asserts! (<= total-premiums-earned (var-get insurance-treasury)) ERR_INSUFFICIENT_INSURANCE_FUNDS)
+    (try! (as-contract (stx-transfer? total-premiums-earned tx-sender tx-sender)))
+    (map-set insurance-providers
+      { provider: tx-sender, insurance-pool-id: insurance-pool-id }
+      (merge provider-info {
+        earned-premiums: (+ (get earned-premiums provider-info) total-premiums-earned),
+        last-premium-claim: stacks-block-height
+      })
+    )
+    (var-set insurance-treasury (- (var-get insurance-treasury) total-premiums-earned))
+    (ok total-premiums-earned)
+  )
+)
+
+(define-public (initialize-risk-parameters)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set risk-parameters { risk-type: "deposit" } { base-multiplier: u8000, utilization-factor: u1000, volatility-adjustment: u500, historical-loss-rate: u50 })
+    (map-set risk-parameters { risk-type: "loan" } { base-multiplier: u12000, utilization-factor: u1500, volatility-adjustment: u800, historical-loss-rate: u150 })
+    (map-set risk-parameters { risk-type: "liquidation" } { base-multiplier: u15000, utilization-factor: u2000, volatility-adjustment: u1200, historical-loss-rate: u300 })
+    (ok true)
+  )
+)
+
+(define-private (calculate-risk-score (position-type (string-ascii 20)) (pool-id uint) (amount uint))
+  (let
+    (
+      (pool-utilization (calculate-utilization-rate pool-id))
+      (base-risk (if (is-eq position-type "deposit") u5000
+                    (if (is-eq position-type "loan") u8000 u12000)))
+      (utilization-risk (/ (* pool-utilization u2000) u10000))
+      (amount-risk (if (> amount u1000000) u1000 u500))
+    )
+    (+ base-risk utilization-risk amount-risk)
+  )
+)
+
+(define-private (calculate-premium (insurance-pool-id uint) (coverage-amount uint) (duration-blocks uint) (risk-score uint))
+  (match (map-get? insurance-pools { insurance-pool-id: insurance-pool-id })
+    insurance-pool
+    (let
+      (
+        (base-premium (/ (* coverage-amount (get premium-rate insurance-pool) duration-blocks) u1000000))
+        (risk-adjustment (/ (* base-premium risk-score) u10000))
+        (utilization-adjustment (/ (* base-premium (get pool-utilization insurance-pool)) u10000))
+      )
+      (+ base-premium risk-adjustment utilization-adjustment)
+    )
+    u0
+  )
+)
+
+(define-private (calculate-provider-premiums (insurance-pool-id uint) (provider principal) (blocks-elapsed uint))
+  (match (map-get? insurance-providers { provider: provider, insurance-pool-id: insurance-pool-id })
+    provider-info
+    (let
+      (
+        (base-premium-share (/ (* (var-get insurance-treasury) (get coverage-share provider-info)) u10000))
+        (time-factor (if (> blocks-elapsed u1440) u10000 (/ (* blocks-elapsed u10000) u1440)))
+      )
+      (/ (* base-premium-share time-factor) u10000)
+    )
+    u0
+  )
+)
+
+(define-read-only (get-insurance-pool-info (insurance-pool-id uint))
+  (map-get? insurance-pools { insurance-pool-id: insurance-pool-id })
+)
+
+(define-read-only (get-insurance-policy-info (policy-id uint))
+  (map-get? insurance-policies { policy-id: policy-id })
+)
+
+(define-read-only (get-insurance-claim-info (claim-id uint))
+  (map-get? insurance-claims { claim-id: claim-id })
+)
+
+(define-read-only (get-provider-info (provider principal) (insurance-pool-id uint))
+  (map-get? insurance-providers { provider: provider, insurance-pool-id: insurance-pool-id })
+)
+
+(define-read-only (get-risk-parameters (risk-type (string-ascii 20)))
+  (map-get? risk-parameters { risk-type: risk-type })
+)
+
+(define-read-only (get-total-insurance-pools)
+  (var-get total-insurance-pools)
+)
+
+(define-read-only (get-total-insurance-policies)
+  (var-get total-policies)
+)
+
+(define-read-only (get-insurance-treasury-balance)
+  (var-get insurance-treasury)
+)
+
+
